@@ -1447,7 +1447,7 @@ async def run_job(job: Job):
             force_close=False,
             enable_cleanup_closed=True,
             keepalive_timeout=180,
-            tcp_nodelay=True,
+            # tcp_nodelay removed — deprecated in newer aiohttp (now always enabled by default)
         )
     elif job.vip:
         connector = aiohttp.TCPConnector(
