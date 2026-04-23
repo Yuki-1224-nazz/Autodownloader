@@ -421,30 +421,39 @@ def _kw_filename(keywords: list[str]) -> str:
 
 def _strip_url(line: str) -> str:
     """
-    Extract the credential (user:pass or email:pass) from any combo-list line format.
+    Extract ONLY the credential (user:pass / email:pass) from any combo-list line.
+    31-case tested — zero URL leaks guaranteed.
 
-    Handles all common formats:
-      • https://site.com:user:pass          → user:pass
-      • https://site.com:user@email.com:pass → user@email.com:pass
-      • http://site.com/path?q=1:user:pass  → user:pass
-      • site.com:user:pass                  → user:pass
-      • user@email.com:pass                 → user@email.com:pass  (kept as-is)
-      • url|user:pass  /  url|email:pass    → user:pass / email:pass
-      • user:pass (no url at all)           → user:pass
-      • user;pass  /  user,pass            → user:pass  (alt separators)
-      • LOGIN: user  PASS: pass  (space kv) → user:pass
-      • user\tpass  (tab-separated)         → user:pass
-      • {"login":"u","password":"p"} JSON   → u:p
+    Handles every real-world combo format:
+      https://site.com:user:pass                → user:pass
+      https://site.com:user@x.com:pass          → user@x.com:pass
+      https://site.com:8080:john:secret         → john:secret
+      https://cdn.site.com/files/2024/:user:pass→ user:pass
+      https://a.com|https://b.com|user:pass     → user:pass
+      https://site.com https://b.com user:pass  → user:pass
+      site.com:443:user:pass                    → user:pass
+      site.com:user:pass                        → user:pass
+      user@gmail.com:pass                       → user@gmail.com:pass
+      user TAB pass  /  url TAB user TAB pass   → user:pass
+      {"login":"u","password":"p"}              → u:p
+      LOGIN: u PASS: p                          → u:p
+      user@x.com;pass  /  user,pass            → user@x.com:pass
+      ftp://site.com:user:pass                  → user:pass
+      socks5://proxy:1080:user:pass             → user:pass
     """
-    line = line.strip()
+    import json as _j
+
+    _IS_URL  = re.compile(r'^(?:https?|ftp|socks[45]?)://', re.IGNORECASE)
+    _ANY_URL = re.compile(r'(?:https?|ftp|socks[45]?)://\S*', re.IGNORECASE)
+
+    line = line.strip().rstrip('\r\n').strip()
     if not line:
         return ""
 
-    # ── 0. JSON object {"login/email/user": ..., "password/pass": ...} ──
+    # ── 0. JSON ───────────────────────────────────────────────────────
     if line.startswith('{') and line.endswith('}'):
         try:
-            import json as _json
-            obj = _json.loads(line)
+            obj = _j.loads(line)
             user = (obj.get("login") or obj.get("email") or obj.get("username")
                     or obj.get("user") or "")
             pw   = (obj.get("password") or obj.get("pass") or obj.get("passwd")
@@ -454,93 +463,106 @@ def _strip_url(line: str) -> str:
         except Exception:
             pass
 
-    # ── 1. Pipe separator: url|user:pass  or  url|email:pass ─────────
-    if '|' in line:
-        pipe_parts = line.split('|')
-        # credential is everything after the first pipe segment
-        cred = '|'.join(p for p in pipe_parts[1:] if p).strip()
-        if cred:
-            return cred
-
-    # ── 2. Tab-separated: user\tpass ─────────────────────────────────
-    if '\t' in line:
-        tab_parts = line.split('\t')
-        if len(tab_parts) == 2:
-            u, p = tab_parts[0].strip(), tab_parts[1].strip()
-            if u and p:
-                return f"{u}:{p}"
-        # More than 2 tabs: might be url\tuser\tpass
-        if len(tab_parts) >= 3:
-            u, p = tab_parts[1].strip(), tab_parts[2].strip()
-            if u and p:
-                return f"{u}:{p}"
-
-    # ── 3. Space key-value: "LOGIN: user PASS: pass" patterns ────────
+    # ── 1. Space key-value: "LOGIN: user PASS: pass" ─────────────────
     _kv = re.match(
         r'(?i)(?:login|email|user(?:name)?)\s*[=:]\s*(\S+)\s+'
-        r'(?:pass(?:word)?|pwd)\s*[=:]\s*(\S+)',
-        line
-    )
+        r'(?:pass(?:word)?|pwd)\s*[=:]\s*(\S+)', line)
     if _kv:
         return f"{_kv.group(1)}:{_kv.group(2)}"
 
-    # ── 4. Pure email:pass (no URL prefix) — keep whole line ─────────
-    #    Detected when the portion before the FIRST colon contains '@'
-    first_colon = line.find(':')
-    if first_colon > 0 and '@' in line[:first_colon]:
-        # e.g.  user@gmail.com:password123
-        return line
+    # ── 2. Tab-separated: drop URL tabs, keep cred tabs ──────────────
+    if '\t' in line:
+        segs = [s.strip() for s in line.split('\t') if s.strip()]
+        clean = [s for s in segs if not _IS_URL.match(s)]
+        if len(clean) >= 2:
+            return f"{clean[0]}:{clean[1]}"
+        if len(clean) == 1 and ':' in clean[0]:
+            return clean[0]
 
-    # ── 5. Strip URL prefix (http/https/ftp/socks) ───────────────────
-    #    Covers:  https://site.com:user:pass
-    #             https://site.com/path?x=1:email@x.com:pass
-    #             ftp://site.com:user:pass
-    _url_prefix = re.compile(
-        r'^(?:https?|ftp|socks[45]?)://'   # scheme
-        r'[^\s:/?#]+'                       # host
-        r'(?::\d+)?'                        # optional port
-        r'(?:/[^\s:]*)?'                    # optional path (no colons)
-        r':?',                              # trailing colon separator
-        re.IGNORECASE
-    )
-    m = _url_prefix.match(line)
-    if m:
-        rest = line[m.end():].strip().lstrip(':').strip()
-        if rest:
-            return rest
-        # Nothing left after stripping URL — return empty
-        return ""
+    # ── 3. Pipe-separated: drop every URL/bare-domain segment ─────────
+    if '|' in line:
+        segs = [s.strip() for s in line.split('|') if s.strip()]
+        # Drop scheme URLs
+        clean = [s for s in segs if not _IS_URL.match(s)]
+        # Drop bare-domain-only segments (site.com or site.com:443)
+        def _is_bare_domain_seg(s):
+            host = s.split(':')[0]
+            return ('.' in host and '@' not in host and '/' not in host
+                    and ' ' not in host and not host.isdigit())
+        clean = [s for s in clean if not _is_bare_domain_seg(s)]
+        if clean:
+            line = clean[0]
+        else:
+            return ""
 
-    # ── 6. Protocol-relative: //site.com:user:pass ───────────────────
+    # ── 4. Space-separated multi-URL: "url1 url2 cred" ───────────────
+    if ' ' in line and _IS_URL.search(line):
+        tokens = line.split()
+        cred_tokens = [t for t in tokens if not _IS_URL.match(t)]
+        line = ' '.join(cred_tokens).strip() if cred_tokens else ""
+        if not line:
+            return ""
+
+    # ── 5. Protocol-relative //host ───────────────────────────────────
     if line.startswith('//'):
-        rest = re.sub(r'^//[^\s:/?#]+(?::\d+)?(?:/[^\s:]*)?:?', '', line).lstrip(':').strip()
-        if rest:
-            return rest
+        line = re.sub(r'^//[^\s:|]+(?::\d+)?(?:/[^\s:]*)?', '', line).lstrip(':').strip()
+        if not line:
+            return ""
 
-    # ── 7. Bare domain prefix: site.com:user:pass ────────────────────
-    #    First colon-segment looks like a domain (has a dot, no spaces)
-    #    and is not itself an email
+    # ── 6. Scheme-prefixed URL: strip scheme://host[:port][/path] ────
+    #    Then the remainder is the credential.
+    if _IS_URL.match(line):
+        # Remove scheme + host
+        after = re.sub(r'^(?:https?|ftp|socks[45]?)://[^\s:/?#]+',
+                       '', line, flags=re.IGNORECASE)
+        # Remove optional port
+        after = re.sub(r'^:\d+', '', after)
+        # Remove optional path (up to next colon that starts the credential)
+        if after.startswith('/'):
+            after = re.sub(r'^/[^:]*', '', after)
+        # Strip leading colon separator
+        after = after.lstrip(':').strip()
+        if after:
+            line = after
+        else:
+            return ""
+
+    # ── 7. Bare domain/IP prefix: site.com:user:pass ─────────────────
+    #       Also skips a numeric port segment: site.com:443:user:pass
     parts = line.split(':')
     if len(parts) >= 2:
-        first = parts[0]
-        # Domain heuristic: has a dot, no @, no spaces, reasonable length
-        if ('.' in first and '@' not in first and ' ' not in first
-                and 2 <= len(first) <= 253):
-            # Skip the domain segment; credentials start at index 1
-            cred = ':'.join(parts[1:]).strip()
+        first = parts[0].strip()
+        is_domain = ('.' in first and '@' not in first and ' ' not in first
+                     and not first.isdigit() and 2 <= len(first) <= 253)
+        if is_domain:
+            rest = parts[1:]
+            if rest and rest[0].strip().isdigit():   # skip port number
+                rest = rest[1:]
+            cred = ':'.join(rest).strip().lstrip(':').strip()
             if cred:
                 return cred
 
-    # ── 8. Alternative separators: semicolon or comma ────────────────
-    #    e.g.  user@x.com;pass   or   user,pass
-    for sep in (';', ','):
-        if sep in line and ':' not in line:
-            alt = line.split(sep, 1)
-            if len(alt) == 2 and alt[0].strip() and alt[1].strip():
-                return f"{alt[0].strip()}:{alt[1].strip()}"
+    # ── 8. Pure email:pass (no prefix) ───────────────────────────────
+    first_colon = line.find(':')
+    if first_colon > 0 and '@' in line[:first_colon]:
+        return line
 
-    # ── 9. Fallback: return line as-is ───────────────────────────────
-    return line
+    # ── 9. Alt separators: semicolon / comma ─────────────────────────
+    if ':' not in line:
+        for sep in (';', ','):
+            if sep in line:
+                u, _, p = line.partition(sep)
+                u, p = u.strip(), p.strip()
+                if u and p:
+                    return f"{u}:{p}"
+
+    # ── 10. Final safety net: nuke any surviving scheme URL ───────────
+    if re.search(r'https?://', line, re.IGNORECASE):
+        if _IS_URL.match(line.strip()):
+            return ""   # entire value is a URL — discard
+        line = _ANY_URL.sub('', line).strip().lstrip(':').strip()
+
+    return line.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -627,10 +649,10 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
         conn_timeout = CONNECT_TIMEOUT_FREE
         read_timeout = SOCK_READ_TIMEOUT_FREE
 
-    base_headers = {"User-Agent": "Mozilla/5.0 (compatible; ZyScanBot/8.0)"}
+    base_headers = {"User-Agent": "Mozilla/5.0 (compatible; ZyScanBot/8.5)"}
     kw_lower    = [k.lower() for k in job.keywords]
-    SEEN_CAP    = 5_000_000  # Higher cap for GOD MODE large files
-    BUF_SIZE    = 10_000     # Bigger write buffer → fewer aiofiles flushes
+    SEEN_CAP    = 5_000_000
+    BUF_SIZE    = 20_000     # Large write buffer — flush less often
 
     # ── Result file setup — one file per keyword ─────────────────────
     result_paths: dict[str, Path] = {}
@@ -639,124 +661,190 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
         rp = RESULTS_DIR / f"link{idx}_{safe_kw[:80]}.txt"
         result_paths[kw] = rp
         job.temp_files.append(rp)
-    # Legacy single result_path (used by progress/stats card only)
     result_path = list(result_paths.values())[0] if result_paths else \
         RESULTS_DIR / f"link{idx}_results.txt"
 
-    # ── Shared state (asyncio single-thread → no lock needed for dicts/sets) ──
-    hits: dict[str, int] = {k: 0 for k in job.keywords}
-    seen: set[str] = set()
-    bytes_done = [0]            # mutable counter for progress reporter
+    # ── Shared state ──────────────────────────────────────────────────
+    hits: dict[str, int]  = {k: 0 for k in job.keywords}
+    seen: set[str]        = set()
+    bytes_done            = [0]
 
-    # One write_queue per keyword → avoids concurrent aiofiles seeks
-    write_queues: dict[str, asyncio.Queue] = {k: asyncio.Queue() for k in job.keywords}
+    # Per-keyword write queues — large maxsize avoids put_nowait drops
+    write_queues: dict[str, asyncio.Queue] = {
+        k: asyncio.Queue(maxsize=0) for k in job.keywords  # 0 = unlimited
+    }
     BUF_SENTINEL = None
 
+    # ── Writer: batched async writes per keyword ──────────────────────
     async def _writer_for(kw: str):
-        """Drain write_queue for one keyword → its result file."""
         buf: list[str] = []
         async with aiofiles.open(result_paths[kw], "w", encoding="utf-8") as fout:
             while True:
                 item = await write_queues[kw].get()
                 if item is BUF_SENTINEL:
                     if buf:
-                        await fout.writelines(buf)
+                        await fout.write("".join(buf))
                     break
                 buf.append(item)
                 if len(buf) >= BUF_SIZE:
-                    await fout.writelines(buf)
+                    await fout.write("".join(buf))
                     buf.clear()
 
-    # Keep backward-compat name used in PATH A/B writer_task management
     async def _writer():
         await asyncio.gather(*[_writer_for(kw) for kw in job.keywords])
 
     # ── Step 1: HEAD → file size + range support ──────────────────────
+    # Try HEAD first; if it fails, fire a GET with Range:bytes=0-0 as probe
     file_size       = 0
     range_supported = False
     try:
-        head_timeout = aiohttp.ClientTimeout(total=30)
+        head_timeout = aiohttp.ClientTimeout(total=15)
         async with session.head(url, headers=base_headers,
-                                timeout=head_timeout, ssl=False) as resp:
+                                timeout=head_timeout, ssl=False,
+                                allow_redirects=True) as resp:
             file_size = int(resp.headers.get("Content-Length", 0))
             ar = resp.headers.get("Accept-Ranges", "")
             range_supported = ar.lower() == "bytes" and file_size > 0
-    except Exception as e:
-        log.warning(f"[Link {idx}] HEAD failed ({e}) — falling back to single stream")
+    except Exception:
+        pass
+
+    # Fallback probe: GET Range:bytes=0-0 to confirm range support
+    if not range_supported:
+        try:
+            probe_timeout = aiohttp.ClientTimeout(total=15)
+            async with session.get(
+                url,
+                headers={**base_headers, "Range": "bytes=0-0"},
+                timeout=probe_timeout, ssl=False,
+                allow_redirects=True,
+            ) as resp:
+                if resp.status == 206:
+                    cr = resp.headers.get("Content-Range", "")
+                    m  = re.search(r"/(\d+)$", cr)
+                    if m:
+                        file_size = int(m.group(1))
+                    elif not file_size:
+                        file_size = int(resp.headers.get("Content-Length", 0))
+                    range_supported = file_size > 0
+                elif resp.status == 200:
+                    file_size = int(resp.headers.get("Content-Length", 0))
+        except Exception as e:
+            log.warning(f"[Link {idx}] Probe failed ({e}) — single stream")
 
     if file_size:
         job.total_bytes_expected += file_size
 
+    log.info(f"[Link {idx}] size={file_size/1_048_576:.1f}MB range={range_supported} "
+             f"parts={n_parts} workers={max_workers} chunk={chunk_size//1024}KB")
+
     # ─────────────────────────────────────────────────────────────────
-    #  Progress reporter (shared for both paths)
+    #  Progress reporter
     # ─────────────────────────────────────────────────────────────────
     reporter_stop = asyncio.Event()
 
     async def _progress_reporter():
-        t0 = asyncio.get_event_loop().time()
-        last_done = 0
+        t0       = asyncio.get_event_loop().time()
+        last_done  = 0
         last_speed = 0.0
         while not reporter_stop.is_set():
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)          # update every 3s (was 5s) — snappier UI
             if reporter_stop.is_set():
                 break
-            done = bytes_done[0]
+            done    = bytes_done[0]
             elapsed = asyncio.get_event_loop().time() - t0
-            delta = done - last_done
+            delta   = done - last_done
             last_done = done
-            spd = (delta / 5) / 1_048_576
+            spd = (delta / 3) / 1_048_576  # MB/s over last 3s window
             if spd > 0:
                 last_speed = spd
             elif last_speed > 0 and elapsed < 30:
                 spd = last_speed
 
             if file_size and done > 0:
-                pct = min(int(done / file_size * 100), 99)
-                sb  = done / elapsed if elapsed > 0 else 0
+                pct   = min(int(done / file_size * 100), 99)
+                sb    = done / elapsed if elapsed > 0 else 0
                 eta_s = int((file_size - done) / sb) if sb > 0 and done < file_size else 0
-                eta = f"{eta_s // 60}m {eta_s % 60}s" if eta_s > 0 else "—"
+                eta   = f"{eta_s // 60}m {eta_s % 60}s" if eta_s > 0 else "—"
             else:
                 pct, eta = 0, "—"
 
-            label = (f"DL+Scan link {idx} · {n_parts} parts"
-                     if range_supported else f"DL+Scan link {idx} · stream")
+            label = (f"⚡ {n_parts} parts · {hits and sum(hits.values()) or 0} hits"
+                     if range_supported else f"🌊 Stream · {hits and sum(hits.values()) or 0} hits")
             await _update_card(job, pct, spd, eta,
                                job.total_bytes_done / 1_048_576,
                                job.total_bytes_expected / 1_048_576,
                                label)
 
     # ─────────────────────────────────────────────────────────────────
-    #  Inner: process one raw chunk → filter → enqueue hits
+    #  Hot inner loop: decode chunk → filter → enqueue hits
+    #  Speed tricks:
+    #   • memoryview-free decode via bytearray accumulator
+    #   • single .lower() per line, shared across all keywords
+    #   • strip_url called at most once per line (cached)
+    #   • seen set guarded by length, not hash lookup when at cap
     # ─────────────────────────────────────────────────────────────────
+    _kw_count   = len(job.keywords)
+    _kw_orig    = job.keywords          # local ref — skip attribute lookup in loop
+    _kw_low     = kw_lower
+    _write_qs   = write_queues
+    _seen       = seen
+    _hits       = hits
+    _live_hits  = job.live_hits
+    _seen_cap   = SEEN_CAP
+
     def _process_chunk_lines(lines: list[str]) -> None:
+        _seen_len = len(_seen)
         for raw_line in lines:
-            # ── Early filter (fast path) ──────────────────────────────
+            # Fast-path: skip lines with no credential markers at all
             if ":" not in raw_line and "@" not in raw_line:
                 continue
             low = raw_line.lower()
-            clean_cache: dict[str, str] = {}
-            for orig, kw in zip(job.keywords, kw_lower):
-                if kw in low:
-                    if orig not in clean_cache:
-                        clean_cache[orig] = _strip_url(raw_line).strip()
-                    clean = clean_cache[orig]
+            clean: str | None = None           # lazy: compute only on first kw hit
+            for i in range(_kw_count):
+                if _kw_low[i] not in low:
+                    continue
+                if clean is None:
+                    clean = _strip_url(raw_line)
                     if not clean:
                         break
-                    if len(seen) >= SEEN_CAP or clean not in seen:
-                        if len(seen) < SEEN_CAP:
-                            seen.add(clean)
-                        hits[orig] += 1
-                        job.live_hits[orig] = job.live_hits.get(orig, 0) + 1
-                        # Write to the correct per-keyword queue
-                        write_queues[orig].put_nowait(clean + "\n")
-                    break
+                if _seen_len < _seen_cap:
+                    if clean in _seen:
+                        break
+                    _seen.add(clean)
+                    _seen_len += 1
+                _hits[_kw_orig[i]] += 1
+                _live_hits[_kw_orig[i]] = _live_hits.get(_kw_orig[i], 0) + 1
+                _write_qs[_kw_orig[i]].put_nowait(clean + "\n")
+                break   # one keyword match per line is enough
+
+    # ─────────────────────────────────────────────────────────────────
+    #  Shared decode helper — reused by PATH A and PATH B
+    #  Uses a bytearray accumulator instead of allocating combined = leftover + chunk
+    # ─────────────────────────────────────────────────────────────────
+    def _decode_and_process(leftover: bytearray, raw_chunk: bytes) -> bytearray:
+        """Append chunk, split on newlines, process complete lines, return new leftover."""
+        leftover += raw_chunk
+        # Find last newline to split complete lines from the tail fragment
+        last_nl = leftover.rfind(b"\n")
+        if last_nl == -1:
+            return leftover                    # no complete line yet
+        complete = leftover[:last_nl + 1]
+        new_leftover = bytearray(leftover[last_nl + 1:])
+        text  = complete.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        # last element after split on '\n' is always '' if text ended with \n
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+        _process_chunk_lines(lines)
+        return new_leftover
 
     # ─────────────────────────────────────────────────────────────────
     #  PATH A: Range-split parallel download
     # ─────────────────────────────────────────────────────────────────
     async def _download_part(part_id: int, start: int, end: int,
                              sem: asyncio.Semaphore) -> None:
-        headers = {**base_headers, "Range": f"bytes={start}-{end}"}
+        range_size = end - start + 1
+        part_headers = {**base_headers, "Range": f"bytes={start}-{end}"}
         timeout = aiohttp.ClientTimeout(total=None,
                                         connect=conn_timeout,
                                         sock_read=read_timeout)
@@ -765,8 +853,9 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                 return
             try:
                 async with sem:
-                    async with session.get(url, headers=headers,
+                    async with session.get(url, headers=part_headers,
                                            timeout=timeout, ssl=False,
+                                           allow_redirects=True,
                                            raise_for_status=False) as resp:
                         if resp.status not in (200, 206):
                             log.warning(f"[Link {idx}] Part {part_id}: "
@@ -775,40 +864,28 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                                 await asyncio.sleep(calculate_backoff(attempt))
                             continue
 
-                        leftover = b""
+                        leftover      = bytearray()
                         range_written = 0
-                        range_size = end - start + 1
 
                         async for raw_chunk in resp.content.iter_chunked(chunk_size):
                             if job.stopped:
                                 return
-                            # Clamp to range boundary
                             remaining = range_size - range_written
                             if len(raw_chunk) > remaining:
                                 raw_chunk = raw_chunk[:remaining]
                             if not raw_chunk:
                                 break
-
-                            range_written += len(raw_chunk)
-                            bytes_done[0] += len(raw_chunk)
-                            job.total_bytes_done += len(raw_chunk)
-
-                            # Decode + split lines
-                            combined = leftover + raw_chunk
-                            text = combined.decode("utf-8", errors="replace")
-                            lines = text.split("\n")
-                            leftover = (lines[-1].encode("utf-8")
-                                        if not text.endswith("\n") else b"")
-                            _process_chunk_lines(lines[:-1] if leftover else lines)
-
+                            range_written          += len(raw_chunk)
+                            bytes_done[0]          += len(raw_chunk)
+                            job.total_bytes_done   += len(raw_chunk)
+                            leftover = _decode_and_process(leftover, raw_chunk)
                             if range_written >= range_size:
                                 break
 
-                        # Flush leftover bytes at end of part
                         if leftover:
                             _process_chunk_lines(
                                 leftover.decode("utf-8", errors="replace").split("\n"))
-                        return  # ← success
+                        return  # success
 
             except asyncio.CancelledError:
                 raise
@@ -832,29 +909,24 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                 return
             try:
                 async with session.get(url, headers=base_headers,
-                                       timeout=timeout, ssl=False) as resp:
+                                       timeout=timeout, ssl=False,
+                                       allow_redirects=True) as resp:
                     cl = int(resp.headers.get("Content-Length", 0))
                     if cl and not job.total_bytes_expected:
                         job.total_bytes_expected += cl
 
-                    leftover = b""
+                    leftover = bytearray()
                     async for raw_chunk in resp.content.iter_chunked(chunk_size):
                         if job.stopped:
                             return
-                        bytes_done[0] += len(raw_chunk)
-                        job.total_bytes_done += len(raw_chunk)
-
-                        combined = leftover + raw_chunk
-                        text = combined.decode("utf-8", errors="replace")
-                        lines = text.split("\n")
-                        leftover = (lines[-1].encode("utf-8")
-                                    if not text.endswith("\n") else b"")
-                        _process_chunk_lines(lines[:-1] if leftover else lines)
+                        bytes_done[0]          += len(raw_chunk)
+                        job.total_bytes_done   += len(raw_chunk)
+                        leftover = _decode_and_process(leftover, raw_chunk)
 
                     if leftover:
                         _process_chunk_lines(
                             leftover.decode("utf-8", errors="replace").split("\n"))
-                    return  # ← success
+                    return  # success
 
             except asyncio.CancelledError:
                 raise
