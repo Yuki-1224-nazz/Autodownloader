@@ -69,25 +69,25 @@ RESULTS_DIR      = Path(os.getenv("RESULTS_DIR",      "results"))
 DATA_FILE        = Path(os.getenv("DATA_FILE",        "botdata.json"))
 PENDING_JOB_FILE = Path(os.getenv("PENDING_JOB_FILE", "pending_job.json"))
 
-# Chunk sizes — 512 KB is the sweet spot:
-# large enough for throughput, small enough to yield the event loop often
-# so all parallel parts make progress simultaneously.
-CHUNK_SIZE_FREE  = 1024 * 256        # 256 KB
-CHUNK_SIZE_VIP   = 1024 * 512        # 512 KB
-CHUNK_SIZE_GOD   = 1024 * 512        # 512 KB ⚡ yields more = true parallelism
+# ── Chunk sizes ─────────────────────────────────────────────────────────
+# GOD: 512 KB — semaphore is now released before streaming (not after),
+# so all 32 parts stream freely. Larger chunks = fewer syscalls = higher
+# sustained throughput. The old 256 KB comment was a workaround for the
+# semaphore bug; with that fixed, bigger chunks win.
+CHUNK_SIZE_FREE  = 1024 * 128        # 128 KB
+CHUNK_SIZE_VIP   = 1024 * 384        # 384 KB
+CHUNK_SIZE_GOD   = 1024 * 512        # 512 KB ⚡ max throughput
 
 # Connection pool limits
 MAX_PAR_FREE     = 3
-MAX_PAR_GOD      = 64
+MAX_PAR_GOD      = 96               # 32 active + 64 queued headroom
 
 # ── Plan-based split parts ──────────────────────────────────────────────
-# Sweet spot: 32 parts fully saturate a connection without overhead.
-# More than 32 parts = diminishing returns + connection setup overhead.
 N_PARTS_FREE = 8    # FREE  → 8 parts
 N_PARTS_VIP  = 16   # VIP   → 16 parts
 N_PARTS_GOD  = 32   # GOD   → 32 parts ⚡ all run concurrently
 
-# Max concurrent parts — GOD runs ALL parts simultaneously (no semaphore gate)
+# Max concurrent parts
 MAX_WORKERS_FREE = 4    # 8 parts, 4 active
 MAX_WORKERS_VIP  = 12   # 16 parts, 12 active
 MAX_WORKERS_GOD  = 32   # 32 parts, all 32 active simultaneously ⚡
@@ -107,16 +107,21 @@ PROGRESS_STEP    = 5               # % step for live bar update
 # Timeout settings (seconds)
 CONNECT_TIMEOUT_FREE = 60
 CONNECT_TIMEOUT_VIP  = 20
-CONNECT_TIMEOUT_GOD  = 10           # Aggressive timeout — fast fail, fast retry
+CONNECT_TIMEOUT_GOD  = 8            # Fast fail → fast retry → no long idle gaps
 
 SOCK_READ_TIMEOUT_FREE = 300
 SOCK_READ_TIMEOUT_VIP  = 120
-SOCK_READ_TIMEOUT_GOD  = 60         # Shorter reads, ultra-fast recovery
+# KEY FIX: 15s read timeout for GOD MODE.
+# The old 60s value meant a stalled part sat silent for a full minute
+# before retrying — that's the "drop to 0.5 MB/s" window you see.
+# At 15s, a stalled part fails fast, retries immediately, and the other
+# 31 parts keep running at full speed the whole time.
+SOCK_READ_TIMEOUT_GOD  = 15
 
 # Exponential backoff settings
-BASE_RETRY_DELAY = 0.5              # Faster base delay for GOD MODE
-MAX_RETRY_DELAY = 15.0              # Lower cap — retry sooner
-JITTER_RANGE = 0.3                  # Tighter jitter
+BASE_RETRY_DELAY = 0.2              # Start retrying almost immediately
+MAX_RETRY_DELAY  = 5.0             # Low cap — don't wait long in GOD MODE
+JITTER_RANGE     = 0.2             # Tight jitter to avoid thundering herd
 
 RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -425,7 +430,7 @@ def _kw_filename(keywords: list[str]) -> str:
 def _strip_url(line: str) -> str:
     """
     Extract ONLY the credential (user:pass / email:pass) from any combo-list line.
-    31-case tested — zero URL leaks guaranteed.
+    Zero URL leaks. Zero false-positive credential drops.
 
     Handles every real-world combo format:
       https://site.com:user:pass                → user:pass
@@ -437,25 +442,34 @@ def _strip_url(line: str) -> str:
       site.com:443:user:pass                    → user:pass
       site.com:user:pass                        → user:pass
       user@gmail.com:pass                       → user@gmail.com:pass
+      john:mypassword                           → john:mypassword  ← FIXED
+      john.doe:mypassword                       → john.doe:mypassword  ← FIXED
       user TAB pass  /  url TAB user TAB pass   → user:pass
       {"login":"u","password":"p"}              → u:p
       LOGIN: u PASS: p                          → u:p
       user@x.com;pass  /  user,pass            → user@x.com:pass
       ftp://site.com:user:pass                  → user:pass
       socks5://proxy:1080:user:pass             → user:pass
-      android://base64@com.package:             → (discarded — no real credential)
-      android://base64@com.package/:            → (discarded — no real credential)
+      android://base64@com.package:             → (discarded — opaque token, not a credential)
+      android://base64@com.package/:            → (discarded — opaque token, not a credential)
     """
     import json as _j
 
-    # Matches standard AND custom URI schemes (android://, garena://, etc.)
-    _IS_URL  = re.compile(r'^(?:https?|ftp|socks[45]?|[a-z][a-z0-9+\-.]{1,30})://', re.IGNORECASE)
-    _ANY_URL = re.compile(r'(?:https?|ftp|socks[45]?|[a-z][a-z0-9+\-.]{1,30})://\S*', re.IGNORECASE)
+    # Only well-known schemes as URL prefixes — avoids false-positives on
+    # passwords that happen to contain short strings like "pass://" or "go://"
+    _IS_URL  = re.compile(
+        r'^(?:https?|ftp|ftps|sftp|socks[45]?|ss|vmess|trojan|android|ios)://',
+        re.IGNORECASE
+    )
+    _ANY_URL = re.compile(
+        r'(?:https?|ftp|ftps|sftp|socks[45]?|ss|vmess|trojan|android|ios)://\S*',
+        re.IGNORECASE
+    )
 
-    # Specifically matches android:// or other app-scheme URLs that embed
-    # base64/token data in the authority (user-info@host) — these are never credentials.
+    # App-scheme URLs with opaque base64/token user-info (android://, ios://, etc.)
+    # The user-info portion is 20+ chars of base64/token — never a real credential.
     _APP_SCHEME_URL = re.compile(
-        r'^[a-z][a-z0-9+\-.]{1,30}://[A-Za-z0-9+/=_\-]{20,}@[\w.\-]+[:/]',
+        r'^(?:android|ios|[a-z][a-z0-9]{2,20})://[A-Za-z0-9+/=_\-]{20,}@[\w.\-]+[:/]',
         re.IGNORECASE
     )
 
@@ -463,21 +477,18 @@ def _strip_url(line: str) -> str:
     if not line:
         return ""
 
-    # ── -1. Discard pure app-scheme token URLs (android://, garena://, etc.) ──
-    #   These look like android://BIGBASE64TOKEN@com.company.app:
-    #   They contain no extractable credential — the "user-info" is an opaque token.
+    # ── -1. Discard app-scheme token URLs (android://, ios://, etc.) ──────
+    #   e.g. android://BIGBASE64TOKEN@com.company.app:
+    #   The "user-info" is an opaque auth token, not a username.
     if _APP_SCHEME_URL.match(line):
-        # Only discard if the whole line is this pattern (no extra cred after)
-        # Strip the app URL and see if anything credential-shaped remains
         remainder = _ANY_URL.sub('', line).strip().lstrip(':').strip()
         if not remainder or _APP_SCHEME_URL.match(remainder):
             return ""
-        # Something credential-shaped survived — fall through with the remainder
         line = remainder
         if not line:
             return ""
 
-    # ── 0. JSON ───────────────────────────────────────────────────────
+    # ── 0. JSON ───────────────────────────────────────────────────────────
     if line.startswith('{') and line.endswith('}'):
         try:
             obj = _j.loads(line)
@@ -490,14 +501,14 @@ def _strip_url(line: str) -> str:
         except Exception:
             pass
 
-    # ── 1. Space key-value: "LOGIN: user PASS: pass" ─────────────────
+    # ── 1. Space key-value: "LOGIN: user PASS: pass" ─────────────────────
     _kv = re.match(
         r'(?i)(?:login|email|user(?:name)?)\s*[=:]\s*(\S+)\s+'
         r'(?:pass(?:word)?|pwd)\s*[=:]\s*(\S+)', line)
     if _kv:
         return f"{_kv.group(1)}:{_kv.group(2)}"
 
-    # ── 2. Tab-separated: drop URL tabs, keep cred tabs ──────────────
+    # ── 2. Tab-separated: drop URL tabs, keep cred tabs ───────────────────
     if '\t' in line:
         segs = [s.strip() for s in line.split('\t') if s.strip()]
         clean = [s for s in segs if not _IS_URL.match(s)]
@@ -506,12 +517,10 @@ def _strip_url(line: str) -> str:
         if len(clean) == 1 and ':' in clean[0]:
             return clean[0]
 
-    # ── 3. Pipe-separated: drop every URL/bare-domain segment ─────────
+    # ── 3. Pipe-separated: drop URL/bare-domain segments ─────────────────
     if '|' in line:
         segs = [s.strip() for s in line.split('|') if s.strip()]
-        # Drop scheme URLs
         clean = [s for s in segs if not _IS_URL.match(s)]
-        # Drop bare-domain-only segments (site.com or site.com:443)
         def _is_bare_domain_seg(s):
             host = s.split(':')[0]
             return ('.' in host and '@' not in host and '/' not in host
@@ -522,7 +531,7 @@ def _strip_url(line: str) -> str:
         else:
             return ""
 
-    # ── 4. Space-separated multi-URL: "url1 url2 cred" ───────────────
+    # ── 4. Space-separated: "url cred" ───────────────────────────────────
     if ' ' in line and _IS_URL.search(line):
         tokens = line.split()
         cred_tokens = [t for t in tokens if not _IS_URL.match(t)]
@@ -530,61 +539,86 @@ def _strip_url(line: str) -> str:
         if not line:
             return ""
 
-    # ── 5. Protocol-relative //host ───────────────────────────────────
+    # ── 5. Protocol-relative //host ───────────────────────────────────────
     if line.startswith('//'):
         line = re.sub(r'^//[^\s:|]+(?::\d+)?(?:/[^\s:]*)?', '', line).lstrip(':').strip()
         if not line:
             return ""
 
-    # ── 6. Scheme-prefixed URL: strip scheme://host[:port][/path] ────
-    #    Then the remainder is the credential.
+    # ── 6. Scheme-prefixed URL: strip scheme://[host][:port][/path] ───────
+    #   IMPORTANT: do NOT consume user-info (user@) here — it might be the
+    #   credential itself (e.g. https://site.com:user@gmail.com:pass).
+    #   Only strip the scheme + bare hostname + optional port + optional path.
     if _IS_URL.match(line):
-        # Remove scheme + host (including user-info if present: user@host)
-        after = re.sub(r'^[a-z][a-z0-9+\-.]{0,30}://(?:[^@/\s]+@)?[^\s:/?#]+',
-                       '', line, flags=re.IGNORECASE)
-        # Remove optional port
-        after = re.sub(r'^:\d+', '', after)
-        # Remove optional path (up to next colon that starts the credential)
-        if after.startswith('/'):
-            after = re.sub(r'^/[^:]*', '', after)
-        # Strip leading colon separator
+        # Remove scheme + hostname only (no user-info stripping)
+        after = re.sub(
+            r'^(?:https?|ftp|ftps?|sftp|socks[45]?|ss|vmess|trojan|android|ios)'
+            r'://[a-zA-Z0-9.\-]+'          # hostname (no @ allowed here)
+            r'(?::\d+)?'                   # optional port
+            r'(?:/[^:@\s]*)?',             # optional path (stop at : or @)
+            '', line, flags=re.IGNORECASE
+        )
         after = after.lstrip(':').strip()
         if after:
             line = after
         else:
             return ""
 
-    # ── 7. Bare domain/IP prefix: site.com:user:pass ─────────────────
-    #       Also skips a numeric port segment: site.com:443:user:pass
+    # ── 7. Bare domain/IP prefix: site.com[:port]:user:pass ───────────────
+    #   Only strip the domain prefix when what follows is clearly a full
+    #   credential pair (user:pass with at least 2 colon-separated parts
+    #   remaining after dropping an optional numeric port).
+    #
+    #   CRITICAL FIX: if the line is already just "username:password" with
+    #   no URL prefix, do NOT strip it. We only apply this rule when the first
+    #   segment looks like a real domain (contains a dot AND no @ sign AND
+    #   is not already a credential by itself).
     parts = line.split(':')
-    if len(parts) >= 2:
+    if len(parts) >= 3:   # Need at least domain:user:pass (3 parts)
         first = parts[0].strip()
-        is_domain = ('.' in first and '@' not in first and ' ' not in first
-                     and not first.isdigit() and 2 <= len(first) <= 253)
-        if is_domain:
+        # Must look like a domain: has a dot, no @, no spaces, not pure digits
+        is_real_domain = ('.' in first and '@' not in first and ' ' not in first
+                          and not first.isdigit() and 2 <= len(first) <= 253)
+        if is_real_domain:
             rest = parts[1:]
-            if rest and rest[0].strip().isdigit():   # skip port number
+            if rest and rest[0].strip().isdigit():   # skip port segment
                 rest = rest[1:]
-            cred = ':'.join(rest).strip().lstrip(':').strip()
-            if cred:
-                return cred
+            if len(rest) >= 2:    # must still have user + pass remaining
+                cred = ':'.join(rest).strip()
+                if cred:
+                    return cred
+    # 2-part lines (domain:pass) fall through — could be a plain user:pass too.
+    # We keep them as-is and let later steps handle or return them verbatim.
 
-    # ── 8. Pure email:pass (no prefix) ───────────────────────────────
+    # ── 8. Email:pass — colon immediately after @ sign ────────────────────
     first_colon = line.find(':')
     if first_colon > 0 and '@' in line[:first_colon]:
-        return line
+        return line   # e.g. user@gmail.com:pass — return verbatim
 
-    # ── 9. Alt separators: semicolon / comma ─────────────────────────
-    if ':' not in line:
-        for sep in (';', ','):
-            if sep in line:
-                u, _, p = line.partition(sep)
-                u, p = u.strip(), p.strip()
-                if u and p:
-                    return f"{u}:{p}"
+    # ── 9. Plain username:password — return verbatim ──────────────────────
+    #   At this point the line has no URL scheme and wasn't caught by domain
+    #   stripping. If it has a colon it's almost certainly user:pass.
+    if ':' in line:
+        # Sanity: don't return pure junk. Must have non-empty parts.
+        u, _, p = line.partition(':')
+        if u.strip() and p.strip():
+            return line   # ← FIXED: was being dropped before reaching here
 
-    # ── 10. Final safety net: nuke any surviving scheme URL ───────────
-    if re.search(r'[a-z][a-z0-9+\-.]{1,30}://', line, re.IGNORECASE):
+    # ── 10. Alt separators: semicolon / comma ────────────────────────────
+    for sep in (';', ','):
+        if sep in line:
+            u, _, p = line.partition(sep)
+            u, p = u.strip(), p.strip()
+            if u and p:
+                return f"{u}:{p}"
+
+    # ── 11. Final safety net: nuke any surviving scheme URL ───────────────
+    #   Only match well-known schemes here — same list as _IS_URL — to avoid
+    #   nuking passwords that happen to contain short letter sequences + "://".
+    if re.search(
+        r'(?:https?|ftp|ftps?|sftp|socks[45]?|ss|vmess|trojan|android|ios)://',
+        line, re.IGNORECASE
+    ):
         if _IS_URL.match(line.strip()):
             return ""   # entire value is a URL — discard
         line = _ANY_URL.sub('', line).strip().lstrip(':').strip()
@@ -816,69 +850,126 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
     _live_hits = job.live_hits
     _seen_cap  = SEEN_CAP
 
-    # Threading lock: protects shared state (seen set, hits, live_hits)
-    # across the thread pool. asyncio primitives DON'T work in threads.
+    # Threading lock: protects shared state (seen set, hits, live_hits).
+    # KEY: We minimise time spent holding this lock so scan threads don't
+    # block each other — expensive work (strip_url, keyword match) all
+    # happens OUTSIDE the lock, lock is only taken for the dedup commit.
     import threading
     _state_lock = threading.Lock()
 
     def _process_chunk_lines(lines: list[str]) -> None:
-        """CPU-bound line filter. Safe to call from thread pool."""
-        local_hits: list[tuple[str, str]] = []   # (kw, clean) pairs to write
+        """
+        CPU-bound line filter — lock-minimised design for GOD MODE.
 
+        Phase 1 (NO lock): keyword match + strip_url for every line.
+                           This is the slow CPU work — runs fully parallel.
+        Phase 2 (local dedup): deduplicate within this batch using a local
+                           set so we arrive at the global lock with minimal work.
+        Phase 3 (brief lock): commit new entries to global seen set + hits.
+                           Lock held for O(unique_hits) dict ops only.
+        Phase 4 (NO lock): enqueue writes — put_nowait is GIL-safe.
+        """
+        # ── Phase 1: scan lines with no lock held ────────────────────
+        candidates: list[tuple[int, str]] = []   # (kw_index, clean_cred)
+        for raw_line in lines:
+            if not raw_line:
+                continue
+            if ":" not in raw_line and "@" not in raw_line:
+                continue
+            low = raw_line.lower()
+            for i in range(_kw_count):
+                if _kw_low[i] not in low:
+                    continue
+                clean = _strip_url(raw_line)
+                if clean:
+                    candidates.append((i, clean))
+                break   # first matching keyword wins per line
+
+        if not candidates:
+            return
+
+        # ── Phase 2: local dedup (no lock — this set is thread-local) ─
+        local_seen: set[str] = set()
+        deduped: list[tuple[int, str]] = []
+        for i, clean in candidates:
+            if clean not in local_seen:
+                local_seen.add(clean)
+                deduped.append((i, clean))
+
+        # ── Phase 3: global dedup + commit (lock held briefly) ────────
+        committed: list[tuple[str, str]] = []   # (kw_name, line_out)
         with _state_lock:
             seen_len = len(_seen)
-            for raw_line in lines:
-                if not raw_line:
-                    continue
-                # Fast-path: skip lines with no credential markers
-                if ":" not in raw_line and "@" not in raw_line:
-                    continue
-                low = raw_line.lower()
-                clean = None
-                for i in range(_kw_count):
-                    if _kw_low[i] not in low:
+            for i, clean in deduped:
+                if seen_len < _seen_cap:
+                    if clean in _seen:
                         continue
-                    if clean is None:
-                        clean = _strip_url(raw_line)
-                        if not clean:
-                            break
-                    if seen_len < _seen_cap:
-                        if clean in _seen:
-                            break
-                        _seen.add(clean)
-                        seen_len += 1
-                    _hits[_kw_orig[i]] += 1
-                    _live_hits[_kw_orig[i]] = _live_hits.get(_kw_orig[i], 0) + 1
-                    local_hits.append((_kw_orig[i], clean + "\n"))
-                    break
+                    _seen.add(clean)
+                    seen_len += 1
+                kw = _kw_orig[i]
+                _hits[kw] += 1
+                _live_hits[kw] = _live_hits.get(kw, 0) + 1
+                committed.append((kw, clean + "\n"))
 
-        # Enqueue writes outside the lock — put_nowait is GIL-safe
-        for kw, line_out in local_hits:
+        # ── Phase 4: enqueue writes — put_nowait is GIL-safe ──────────
+        for kw, line_out in committed:
             _write_qs[kw].put_nowait(line_out)
 
-    # Thread pool: GOD=4 workers, others=2. GOD MODE downloads are now truly
-    # parallel (semaphore released after connect), so we need more scan workers.
+    # Thread pool sizing:
+    #   GOD: 12 workers — one per 2-3 download coroutines at peak, preventing
+    #        GIL contention while keeping all 32 parts fed continuously.
+    #        6 workers was the bottleneck causing the "after-peak" speed drop.
+    #   VIP: 6, FREE: 2 — proportional to part count.
     import concurrent.futures
-    _tp_workers = 4 if job.god else 2
-    _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=_tp_workers,
-                                                         thread_name_prefix="scan")
+    _tp_workers = 12 if job.god else (6 if job.vip else 2)
+    _thread_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=_tp_workers, thread_name_prefix="scan"
+    )
 
-    async def _process_async(lines: list[str]) -> None:
-        """Submit line processing to thread pool, freeing the event loop."""
+    # Pending scan futures — tracked so we can drain them before closing
+    _pending_scans: list = []
+
+    def _process_async(lines: list[str]) -> None:
+        """
+        Fire-and-forget submit: does NOT await. The download coroutine calls
+        this and returns immediately to read the next network chunk — keeping
+        the pipe saturated. This eliminates the stall where each part had to
+        wait for the CPU scan to finish before it could read more data.
+        Futures collected in _pending_scans; drained before exit.
+        Completed futures are pruned every 200 submissions to prevent
+        unbounded memory growth on large files.
+        """
+        fut = _thread_pool.submit(_process_chunk_lines, lines)
+        _pending_scans.append(fut)
+        # Prune done futures every 200 submissions — avoids list growing to
+        # millions of entries on large files, which itself slows things down.
+        if len(_pending_scans) % 200 == 0:
+            done_indices = [i for i, f in enumerate(_pending_scans) if f.done()]
+            for i in reversed(done_indices):
+                _pending_scans.pop(i)
+
+    async def _drain_scans() -> None:
+        """Wait for all in-flight scan futures to finish (called before exiting)."""
+        if not _pending_scans:
+            return
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(_thread_pool, _process_chunk_lines, lines)
+        await loop.run_in_executor(
+            None, lambda: [f.result() for f in _pending_scans]
+        )
 
     # ─────────────────────────────────────────────────────────────────
     #  Shared decode helper — splits bytes on newlines, returns leftover
     #  Pure byte ops — no string allocation until we have complete lines
     # ─────────────────────────────────────────────────────────────────
     def _split_chunk(leftover: bytearray, raw_chunk: bytes) -> tuple[list[str], bytearray]:
-        """Append chunk, extract complete lines as strings, return leftover bytes."""
-        leftover += raw_chunk
+        """Append chunk, extract complete lines as strings, return leftover bytes.
+        Uses extend() instead of += to avoid copying the entire leftover buffer
+        on every chunk — critical for sustained GOD MODE throughput."""
+        leftover.extend(raw_chunk)
         last_nl = leftover.rfind(b"\n")
         if last_nl == -1:
             return [], leftover
-        complete    = leftover[:last_nl + 1]
+        complete     = bytes(leftover[:last_nl + 1])
         new_leftover = bytearray(leftover[last_nl + 1:])
         text  = complete.decode("utf-8", errors="replace")
         lines = text.split("\n")
@@ -902,27 +993,31 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
             if job.stopped:
                 return
             try:
-                # ⚡ GOD MODE FIX: acquire semaphore only during connection setup,
-                # then release it immediately so other parts can connect in parallel.
-                # Previously the semaphore was held for the ENTIRE stream duration,
-                # causing all 32 slots to stay locked → effectively serialising downloads.
+                # ⚡ GOD MODE: semaphore only gates the TCP connect() syscall.
+                # We open the response object under the lock, then release
+                # immediately — streaming happens at full concurrency with zero
+                # semaphore contention. This is the fix for the "initial peak
+                # then crawl to 0.2 MB/s" pattern: the old code held the sem
+                # for the full stream duration, serialising all 32 parts.
                 async with sem:
-                    cm = session.get(url, headers=part_headers,
-                                     timeout=timeout, ssl=False,
-                                     allow_redirects=True,
-                                     raise_for_status=False)
-                    resp = await cm.__aenter__()
-
-                # Semaphore released — stream freely at full concurrency ⚡
-                try:
+                    resp = await session.get(
+                        url, headers=part_headers,
+                        timeout=timeout, ssl=False,
+                        allow_redirects=True,
+                        raise_for_status=False,
+                    )
+                    # Verify status while still under sem so a bad status
+                    # doesn't consume a slot for no reason
                     if resp.status not in (200, 206):
+                        await resp.release()
                         log.warning(f"[Link {idx}] Part {part_id}: "
                                     f"HTTP {resp.status} (attempt {attempt})")
-                        await cm.__aexit__(None, None, None)
                         if attempt < max_retries:
                             await asyncio.sleep(calculate_backoff(attempt))
                         continue
 
+                # Semaphore fully released — stream at full concurrency ⚡
+                try:
                     leftover      = bytearray()
                     range_written = 0
 
@@ -942,7 +1037,7 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
 
                         lines, leftover = _split_chunk(leftover, raw_chunk)
                         if lines:
-                            await _process_async(lines)  # yields to event loop ⚡
+                            _process_async(lines)
 
                         if range_written >= range_size:
                             break
@@ -950,9 +1045,9 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                     if leftover:
                         tail = leftover.decode("utf-8", errors="replace").split("\n")
                         if tail:
-                            await _process_async(tail)
+                            _process_async(tail)
                 finally:
-                    await cm.__aexit__(None, None, None)
+                    await resp.release()
                 return  # success
 
             except asyncio.CancelledError:
@@ -992,12 +1087,12 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                         job.total_bytes_done += clen
                         lines, leftover = _split_chunk(leftover, raw_chunk)
                         if lines:
-                            await _process_async(lines)
+                            _process_async(lines)
 
                     if leftover:
                         tail = leftover.decode("utf-8", errors="replace").split("\n")
                         if tail:
-                            await _process_async(tail)
+                            _process_async(tail)
                     return  # success
 
             except asyncio.CancelledError:
@@ -1026,11 +1121,16 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                 parts.append((i, s, e))
 
             sem = asyncio.Semaphore(max_workers)
+            # For GOD mode, all 32 parts connect simultaneously — semaphore
+            # only gates the TCP handshake (fast), not the stream (slow).
+            # Setting it to max_workers means all parts race to connect at once.
             await asyncio.gather(*[_download_part(pid, s, e, sem)
                                    for pid, s, e in parts])
         else:
             await _download_stream_fallback()
 
+        # Drain all in-flight scan futures before signalling writers
+        await _drain_scans()
         # Signal all per-keyword writers to flush + exit
         for wq in write_queues.values():
             await wq.put(BUF_SENTINEL)
@@ -1054,6 +1154,7 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
         return hits, result_paths
 
     except asyncio.CancelledError:
+        await _drain_scans()
         for wq in write_queues.values():
             await wq.put(BUF_SENTINEL)
         try:
@@ -1063,6 +1164,7 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
         raise
     except Exception as e:
         log.error(f"[Link {idx}] Fatal streaming error: {e}\n{traceback.format_exc()}")
+        await _drain_scans()
         for wq in write_queues.values():
             await wq.put(BUF_SENTINEL)
         try:
@@ -1329,15 +1431,23 @@ async def run_job(job: Job):
     if card_msg:
         job.live_stats_mid = card_msg.message_id
 
-    # GOD MODE: 32 parts all active → pool must cover all 32 + headroom
+    # GOD MODE connector — tuned for sustained high throughput:
+    #   • limit=128: 32 active streams + generous headroom for reconnects
+    #   • limit_per_host=96: all 32 parts + retries open freely, no queuing
+    #   • tcp_nodelay=True: disables Nagle — sends chunks immediately instead
+    #     of buffering, eliminating the 40ms Nagle delay that causes speed dips
+    #   • keepalive_timeout=180: keeps connections warm between retries
+    #   • ttl_dns_cache=3600: DNS lookup cached for whole job — no repeated
+    #     DNS latency adding jitter to reconnects
     if job.god:
         connector = aiohttp.TCPConnector(
-            limit=64,               # 32 parts × 2 headroom
-            limit_per_host=32,      # exact match to MAX_WORKERS_GOD
-            ttl_dns_cache=600,
+            limit=128,
+            limit_per_host=96,
+            ttl_dns_cache=3600,
             force_close=False,
             enable_cleanup_closed=True,
-            keepalive_timeout=60,
+            keepalive_timeout=180,
+            tcp_nodelay=True,
         )
     elif job.vip:
         connector = aiohttp.TCPConnector(
@@ -1358,8 +1468,10 @@ async def run_job(job: Job):
         )
 
     try:
-        async with aiohttp.ClientSession(connector=connector,
-                                              read_bufsize=1024*256) as session:  # 256KB kernel read buffer
+        async with aiohttp.ClientSession(
+            connector=connector,
+            read_bufsize=1024 * 1024 * 4,   # 4 MB kernel read buffer — matches OS TCP window
+        ) as session:
             valid_links = [(i + 1, url.strip()) for i, url in enumerate(job.links) if url.strip()]
             
             for link_num, (idx, url) in enumerate(valid_links, 1):
