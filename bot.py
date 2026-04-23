@@ -443,15 +443,39 @@ def _strip_url(line: str) -> str:
       user@x.com;pass  /  user,pass            → user@x.com:pass
       ftp://site.com:user:pass                  → user:pass
       socks5://proxy:1080:user:pass             → user:pass
+      android://base64@com.package:             → (discarded — no real credential)
+      android://base64@com.package/:            → (discarded — no real credential)
     """
     import json as _j
 
-    _IS_URL  = re.compile(r'^(?:https?|ftp|socks[45]?)://', re.IGNORECASE)
-    _ANY_URL = re.compile(r'(?:https?|ftp|socks[45]?)://\S*', re.IGNORECASE)
+    # Matches standard AND custom URI schemes (android://, garena://, etc.)
+    _IS_URL  = re.compile(r'^(?:https?|ftp|socks[45]?|[a-z][a-z0-9+\-.]{1,30})://', re.IGNORECASE)
+    _ANY_URL = re.compile(r'(?:https?|ftp|socks[45]?|[a-z][a-z0-9+\-.]{1,30})://\S*', re.IGNORECASE)
+
+    # Specifically matches android:// or other app-scheme URLs that embed
+    # base64/token data in the authority (user-info@host) — these are never credentials.
+    _APP_SCHEME_URL = re.compile(
+        r'^[a-z][a-z0-9+\-.]{1,30}://[A-Za-z0-9+/=_\-]{20,}@[\w.\-]+[:/]',
+        re.IGNORECASE
+    )
 
     line = line.strip().rstrip('\r\n').strip()
     if not line:
         return ""
+
+    # ── -1. Discard pure app-scheme token URLs (android://, garena://, etc.) ──
+    #   These look like android://BIGBASE64TOKEN@com.company.app:
+    #   They contain no extractable credential — the "user-info" is an opaque token.
+    if _APP_SCHEME_URL.match(line):
+        # Only discard if the whole line is this pattern (no extra cred after)
+        # Strip the app URL and see if anything credential-shaped remains
+        remainder = _ANY_URL.sub('', line).strip().lstrip(':').strip()
+        if not remainder or _APP_SCHEME_URL.match(remainder):
+            return ""
+        # Something credential-shaped survived — fall through with the remainder
+        line = remainder
+        if not line:
+            return ""
 
     # ── 0. JSON ───────────────────────────────────────────────────────
     if line.startswith('{') and line.endswith('}'):
@@ -515,8 +539,8 @@ def _strip_url(line: str) -> str:
     # ── 6. Scheme-prefixed URL: strip scheme://host[:port][/path] ────
     #    Then the remainder is the credential.
     if _IS_URL.match(line):
-        # Remove scheme + host
-        after = re.sub(r'^(?:https?|ftp|socks[45]?)://[^\s:/?#]+',
+        # Remove scheme + host (including user-info if present: user@host)
+        after = re.sub(r'^[a-z][a-z0-9+\-.]{0,30}://(?:[^@/\s]+@)?[^\s:/?#]+',
                        '', line, flags=re.IGNORECASE)
         # Remove optional port
         after = re.sub(r'^:\d+', '', after)
@@ -560,7 +584,7 @@ def _strip_url(line: str) -> str:
                     return f"{u}:{p}"
 
     # ── 10. Final safety net: nuke any surviving scheme URL ───────────
-    if re.search(r'https?://', line, re.IGNORECASE):
+    if re.search(r'[a-z][a-z0-9+\-.]{1,30}://', line, re.IGNORECASE):
         if _IS_URL.match(line.strip()):
             return ""   # entire value is a URL — discard
         line = _ANY_URL.sub('', line).strip().lstrip(':').strip()
@@ -832,9 +856,11 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
         for kw, line_out in local_hits:
             _write_qs[kw].put_nowait(line_out)
 
-    # Thread pool: 2 workers — one active, one ready. More would fight the GIL.
+    # Thread pool: GOD=4 workers, others=2. GOD MODE downloads are now truly
+    # parallel (semaphore released after connect), so we need more scan workers.
     import concurrent.futures
-    _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2,
+    _tp_workers = 4 if job.god else 2
+    _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=_tp_workers,
                                                          thread_name_prefix="scan")
 
     async def _process_async(lines: list[str]) -> None:
@@ -876,47 +902,58 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
             if job.stopped:
                 return
             try:
+                # ⚡ GOD MODE FIX: acquire semaphore only during connection setup,
+                # then release it immediately so other parts can connect in parallel.
+                # Previously the semaphore was held for the ENTIRE stream duration,
+                # causing all 32 slots to stay locked → effectively serialising downloads.
                 async with sem:
-                    async with session.get(url, headers=part_headers,
-                                           timeout=timeout, ssl=False,
-                                           allow_redirects=True,
-                                           raise_for_status=False) as resp:
-                        if resp.status not in (200, 206):
-                            log.warning(f"[Link {idx}] Part {part_id}: "
-                                        f"HTTP {resp.status} (attempt {attempt})")
-                            if attempt < max_retries:
-                                await asyncio.sleep(calculate_backoff(attempt))
-                            continue
+                    cm = session.get(url, headers=part_headers,
+                                     timeout=timeout, ssl=False,
+                                     allow_redirects=True,
+                                     raise_for_status=False)
+                    resp = await cm.__aenter__()
 
-                        leftover      = bytearray()
-                        range_written = 0
+                # Semaphore released — stream freely at full concurrency ⚡
+                try:
+                    if resp.status not in (200, 206):
+                        log.warning(f"[Link {idx}] Part {part_id}: "
+                                    f"HTTP {resp.status} (attempt {attempt})")
+                        await cm.__aexit__(None, None, None)
+                        if attempt < max_retries:
+                            await asyncio.sleep(calculate_backoff(attempt))
+                        continue
 
-                        async for raw_chunk in resp.content.iter_chunked(chunk_size):
-                            if job.stopped:
-                                return
-                            remaining = range_size - range_written
-                            if len(raw_chunk) > remaining:
-                                raw_chunk = raw_chunk[:remaining]
-                            if not raw_chunk:
-                                break
+                    leftover      = bytearray()
+                    range_written = 0
 
-                            clen = len(raw_chunk)
-                            range_written        += clen
-                            bytes_done[0]        += clen
-                            job.total_bytes_done += clen
+                    async for raw_chunk in resp.content.iter_chunked(chunk_size):
+                        if job.stopped:
+                            return
+                        remaining = range_size - range_written
+                        if len(raw_chunk) > remaining:
+                            raw_chunk = raw_chunk[:remaining]
+                        if not raw_chunk:
+                            break
 
-                            lines, leftover = _split_chunk(leftover, raw_chunk)
-                            if lines:
-                                await _process_async(lines)  # yields to event loop ⚡
+                        clen = len(raw_chunk)
+                        range_written        += clen
+                        bytes_done[0]        += clen
+                        job.total_bytes_done += clen
 
-                            if range_written >= range_size:
-                                break
+                        lines, leftover = _split_chunk(leftover, raw_chunk)
+                        if lines:
+                            await _process_async(lines)  # yields to event loop ⚡
 
-                        if leftover:
-                            tail = leftover.decode("utf-8", errors="replace").split("\n")
-                            if tail:
-                                await _process_async(tail)
-                        return  # success
+                        if range_written >= range_size:
+                            break
+
+                    if leftover:
+                        tail = leftover.decode("utf-8", errors="replace").split("\n")
+                        if tail:
+                            await _process_async(tail)
+                finally:
+                    await cm.__aexit__(None, None, None)
+                return  # success
 
             except asyncio.CancelledError:
                 raise
