@@ -69,25 +69,28 @@ RESULTS_DIR      = Path(os.getenv("RESULTS_DIR",      "results"))
 DATA_FILE        = Path(os.getenv("DATA_FILE",        "botdata.json"))
 PENDING_JOB_FILE = Path(os.getenv("PENDING_JOB_FILE", "pending_job.json"))
 
-# Chunk sizes for different tiers
-CHUNK_SIZE_FREE  = 1024 * 512        # 512 KB
-CHUNK_SIZE_VIP   = 1024 * 1024 * 4   # 4 MB — faster reads for VIP
-CHUNK_SIZE_GOD   = 1024 * 1024 * 8   # 8 MB — God Mode ultra chunk
+# Chunk sizes — 512 KB is the sweet spot:
+# large enough for throughput, small enough to yield the event loop often
+# so all parallel parts make progress simultaneously.
+CHUNK_SIZE_FREE  = 1024 * 256        # 256 KB
+CHUNK_SIZE_VIP   = 1024 * 512        # 512 KB
+CHUNK_SIZE_GOD   = 1024 * 512        # 512 KB ⚡ yields more = true parallelism
 
-# Connection pool limits (used for TCPConnector sizing only)
+# Connection pool limits
 MAX_PAR_FREE     = 3
 MAX_PAR_GOD      = 64
 
 # ── Plan-based split parts ──────────────────────────────────────────────
-# Each URL is split into N byte-range parts; parts run in parallel.
-N_PARTS_FREE = 10   # FREE  → 10 parts
-N_PARTS_VIP  = 30   # VIP   → 30 parts
-N_PARTS_GOD  = 50   # GOD   → 50 parts  ⚡ ULTRA
+# Sweet spot: 32 parts fully saturate a connection without overhead.
+# More than 32 parts = diminishing returns + connection setup overhead.
+N_PARTS_FREE = 8    # FREE  → 8 parts
+N_PARTS_VIP  = 16   # VIP   → 16 parts
+N_PARTS_GOD  = 32   # GOD   → 32 parts ⚡ all run concurrently
 
-# Max concurrent parts active at the same time (semaphore workers)
-MAX_WORKERS_FREE = 4   # 10 parts, 4 active at once
-MAX_WORKERS_VIP  = 15  # 30 parts, 15 active at once
-MAX_WORKERS_GOD  = 32  # 50 parts, 32 active at once  ⚡ ULTRA
+# Max concurrent parts — GOD runs ALL parts simultaneously (no semaphore gate)
+MAX_WORKERS_FREE = 4    # 8 parts, 4 active
+MAX_WORKERS_VIP  = 12   # 16 parts, 12 active
+MAX_WORKERS_GOD  = 32   # 32 parts, all 32 active simultaneously ⚡
 
 # Legacy thread-count names (kept so vipinfo display still works)
 N_THREADS_FREE = N_PARTS_FREE
@@ -776,74 +779,95 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                                label)
 
     # ─────────────────────────────────────────────────────────────────
-    #  Hot inner loop: decode chunk → filter → enqueue hits
-    #  Speed tricks:
-    #   • memoryview-free decode via bytearray accumulator
-    #   • single .lower() per line, shared across all keywords
-    #   • strip_url called at most once per line (cached)
-    #   • seen set guarded by length, not hash lookup when at cap
+    #  Hot inner loop — runs in a ThreadPoolExecutor so it NEVER blocks
+    #  the event loop. Downloads on all 32 parts can proceed freely
+    #  while the CPU processes lines on a separate OS thread.
     # ─────────────────────────────────────────────────────────────────
-    _kw_count   = len(job.keywords)
-    _kw_orig    = job.keywords          # local ref — skip attribute lookup in loop
-    _kw_low     = kw_lower
-    _write_qs   = write_queues
-    _seen       = seen
-    _hits       = hits
-    _live_hits  = job.live_hits
-    _seen_cap   = SEEN_CAP
+    _kw_count  = len(job.keywords)
+    _kw_orig   = job.keywords
+    _kw_low    = kw_lower
+    _write_qs  = write_queues
+    _seen      = seen
+    _hits      = hits
+    _live_hits = job.live_hits
+    _seen_cap  = SEEN_CAP
+
+    # Threading lock: protects shared state (seen set, hits, live_hits)
+    # across the thread pool. asyncio primitives DON'T work in threads.
+    import threading
+    _state_lock = threading.Lock()
 
     def _process_chunk_lines(lines: list[str]) -> None:
-        _seen_len = len(_seen)
-        for raw_line in lines:
-            # Fast-path: skip lines with no credential markers at all
-            if ":" not in raw_line and "@" not in raw_line:
-                continue
-            low = raw_line.lower()
-            clean: str | None = None           # lazy: compute only on first kw hit
-            for i in range(_kw_count):
-                if _kw_low[i] not in low:
+        """CPU-bound line filter. Safe to call from thread pool."""
+        local_hits: list[tuple[str, str]] = []   # (kw, clean) pairs to write
+
+        with _state_lock:
+            seen_len = len(_seen)
+            for raw_line in lines:
+                if not raw_line:
                     continue
-                if clean is None:
-                    clean = _strip_url(raw_line)
-                    if not clean:
-                        break
-                if _seen_len < _seen_cap:
-                    if clean in _seen:
-                        break
-                    _seen.add(clean)
-                    _seen_len += 1
-                _hits[_kw_orig[i]] += 1
-                _live_hits[_kw_orig[i]] = _live_hits.get(_kw_orig[i], 0) + 1
-                _write_qs[_kw_orig[i]].put_nowait(clean + "\n")
-                break   # one keyword match per line is enough
+                # Fast-path: skip lines with no credential markers
+                if ":" not in raw_line and "@" not in raw_line:
+                    continue
+                low = raw_line.lower()
+                clean = None
+                for i in range(_kw_count):
+                    if _kw_low[i] not in low:
+                        continue
+                    if clean is None:
+                        clean = _strip_url(raw_line)
+                        if not clean:
+                            break
+                    if seen_len < _seen_cap:
+                        if clean in _seen:
+                            break
+                        _seen.add(clean)
+                        seen_len += 1
+                    _hits[_kw_orig[i]] += 1
+                    _live_hits[_kw_orig[i]] = _live_hits.get(_kw_orig[i], 0) + 1
+                    local_hits.append((_kw_orig[i], clean + "\n"))
+                    break
+
+        # Enqueue writes outside the lock — put_nowait is GIL-safe
+        for kw, line_out in local_hits:
+            _write_qs[kw].put_nowait(line_out)
+
+    # Thread pool: 2 workers — one active, one ready. More would fight the GIL.
+    import concurrent.futures
+    _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2,
+                                                         thread_name_prefix="scan")
+
+    async def _process_async(lines: list[str]) -> None:
+        """Submit line processing to thread pool, freeing the event loop."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(_thread_pool, _process_chunk_lines, lines)
 
     # ─────────────────────────────────────────────────────────────────
-    #  Shared decode helper — reused by PATH A and PATH B
-    #  Uses a bytearray accumulator instead of allocating combined = leftover + chunk
+    #  Shared decode helper — splits bytes on newlines, returns leftover
+    #  Pure byte ops — no string allocation until we have complete lines
     # ─────────────────────────────────────────────────────────────────
-    def _decode_and_process(leftover: bytearray, raw_chunk: bytes) -> bytearray:
-        """Append chunk, split on newlines, process complete lines, return new leftover."""
+    def _split_chunk(leftover: bytearray, raw_chunk: bytes) -> tuple[list[str], bytearray]:
+        """Append chunk, extract complete lines as strings, return leftover bytes."""
         leftover += raw_chunk
-        # Find last newline to split complete lines from the tail fragment
         last_nl = leftover.rfind(b"\n")
         if last_nl == -1:
-            return leftover                    # no complete line yet
-        complete = leftover[:last_nl + 1]
+            return [], leftover
+        complete    = leftover[:last_nl + 1]
         new_leftover = bytearray(leftover[last_nl + 1:])
         text  = complete.decode("utf-8", errors="replace")
         lines = text.split("\n")
-        # last element after split on '\n' is always '' if text ended with \n
         if lines and lines[-1] == "":
             lines = lines[:-1]
-        _process_chunk_lines(lines)
-        return new_leftover
+        return lines, new_leftover
 
     # ─────────────────────────────────────────────────────────────────
     #  PATH A: Range-split parallel download
+    #  Key change: await _process_async() so the event loop yields
+    #  control to other download coroutines while lines are processed.
     # ─────────────────────────────────────────────────────────────────
     async def _download_part(part_id: int, start: int, end: int,
                              sem: asyncio.Semaphore) -> None:
-        range_size = end - start + 1
+        range_size   = end - start + 1
         part_headers = {**base_headers, "Range": f"bytes={start}-{end}"}
         timeout = aiohttp.ClientTimeout(total=None,
                                         connect=conn_timeout,
@@ -875,16 +899,23 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                                 raw_chunk = raw_chunk[:remaining]
                             if not raw_chunk:
                                 break
-                            range_written          += len(raw_chunk)
-                            bytes_done[0]          += len(raw_chunk)
-                            job.total_bytes_done   += len(raw_chunk)
-                            leftover = _decode_and_process(leftover, raw_chunk)
+
+                            clen = len(raw_chunk)
+                            range_written        += clen
+                            bytes_done[0]        += clen
+                            job.total_bytes_done += clen
+
+                            lines, leftover = _split_chunk(leftover, raw_chunk)
+                            if lines:
+                                await _process_async(lines)  # yields to event loop ⚡
+
                             if range_written >= range_size:
                                 break
 
                         if leftover:
-                            _process_chunk_lines(
-                                leftover.decode("utf-8", errors="replace").split("\n"))
+                            tail = leftover.decode("utf-8", errors="replace").split("\n")
+                            if tail:
+                                await _process_async(tail)
                         return  # success
 
             except asyncio.CancelledError:
@@ -898,7 +929,7 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
         log.error(f"[Link {idx}] Part {part_id} FAILED after {max_retries} attempts — skipping")
 
     # ─────────────────────────────────────────────────────────────────
-    #  PATH B: Single-stream fallback (no range support)
+    #  PATH B: Single-stream fallback
     # ─────────────────────────────────────────────────────────────────
     async def _download_stream_fallback() -> None:
         timeout = aiohttp.ClientTimeout(total=None,
@@ -919,13 +950,17 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
                     async for raw_chunk in resp.content.iter_chunked(chunk_size):
                         if job.stopped:
                             return
-                        bytes_done[0]          += len(raw_chunk)
-                        job.total_bytes_done   += len(raw_chunk)
-                        leftover = _decode_and_process(leftover, raw_chunk)
+                        clen = len(raw_chunk)
+                        bytes_done[0]        += clen
+                        job.total_bytes_done += clen
+                        lines, leftover = _split_chunk(leftover, raw_chunk)
+                        if lines:
+                            await _process_async(lines)
 
                     if leftover:
-                        _process_chunk_lines(
-                            leftover.decode("utf-8", errors="replace").split("\n"))
+                        tail = leftover.decode("utf-8", errors="replace").split("\n")
+                        if tail:
+                            await _process_async(tail)
                     return  # success
 
             except asyncio.CancelledError:
@@ -1011,6 +1046,7 @@ async def _process_link_streaming(session, url: str, idx: int, job: Job) -> tupl
             await reporter_task
         except asyncio.CancelledError:
             pass
+        _thread_pool.shutdown(wait=False)
 
 # ─────────────────────────────────────────────────────────────────────
 #  Cleanup
@@ -1256,20 +1292,20 @@ async def run_job(job: Job):
     if card_msg:
         job.live_stats_mid = card_msg.message_id
 
-    # GOD MODE: Ultra connection pool — 100 total / 64 per-host
+    # GOD MODE: 32 parts all active → pool must cover all 32 + headroom
     if job.god:
         connector = aiohttp.TCPConnector(
-            limit=100,              # Total connection pool (matches 50 parts × 2)
-            limit_per_host=64,      # Per-host limit covers all concurrent parts
-            ttl_dns_cache=600,      # Cache DNS longer — fewer lookups
+            limit=64,               # 32 parts × 2 headroom
+            limit_per_host=32,      # exact match to MAX_WORKERS_GOD
+            ttl_dns_cache=600,
             force_close=False,
             enable_cleanup_closed=True,
-            keepalive_timeout=60,   # Keep connections warm between parts
+            keepalive_timeout=60,
         )
     elif job.vip:
         connector = aiohttp.TCPConnector(
-            limit=50,
-            limit_per_host=20,
+            limit=32,
+            limit_per_host=16,
             ttl_dns_cache=300,
             force_close=False,
             enable_cleanup_closed=True,
@@ -1277,7 +1313,7 @@ async def run_job(job: Job):
         )
     else:
         connector = aiohttp.TCPConnector(
-            limit=20,
+            limit=16,
             limit_per_host=8,
             ttl_dns_cache=300,
             force_close=False,
@@ -1285,7 +1321,8 @@ async def run_job(job: Job):
         )
 
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession(connector=connector,
+                                              read_bufsize=1024*256) as session:  # 256KB kernel read buffer
             valid_links = [(i + 1, url.strip()) for i, url in enumerate(job.links) if url.strip()]
             
             for link_num, (idx, url) in enumerate(valid_links, 1):
