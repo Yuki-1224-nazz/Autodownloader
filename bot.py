@@ -1193,7 +1193,6 @@ async def run_job(job: Job):
             force_close=False,
             enable_cleanup_closed=True,
             keepalive_timeout=60,   # Keep connections warm between parts
-            tcp_keepalive=True,
         )
     elif job.vip:
         connector = aiohttp.TCPConnector(
