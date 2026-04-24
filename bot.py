@@ -442,8 +442,8 @@ def _strip_url(line: str) -> str:
       site.com:443:user:pass                    → user:pass
       site.com:user:pass                        → user:pass
       user@gmail.com:pass                       → user@gmail.com:pass
-      john:mypassword                           → john:mypassword  ← FIXED
-      john.doe:mypassword                       → john.doe:mypassword  ← FIXED
+      john:mypassword                           → john:mypassword
+      john.doe:mypassword                       → john.doe:mypassword
       user TAB pass  /  url TAB user TAB pass   → user:pass
       {"login":"u","password":"p"}              → u:p
       LOGIN: u PASS: p                          → u:p
@@ -481,12 +481,7 @@ def _strip_url(line: str) -> str:
     #   e.g. android://BIGBASE64TOKEN@com.company.app:
     #   The "user-info" is an opaque auth token, not a username.
     if _APP_SCHEME_URL.match(line):
-        remainder = _ANY_URL.sub('', line).strip().lstrip(':').strip()
-        if not remainder or _APP_SCHEME_URL.match(remainder):
-            return ""
-        line = remainder
-        if not line:
-            return ""
+        return ""
 
     # ── 0. JSON ───────────────────────────────────────────────────────────
     if line.startswith('{') and line.endswith('}'):
@@ -531,13 +526,19 @@ def _strip_url(line: str) -> str:
         else:
             return ""
 
-    # ── 4. Space-separated: "url cred" ───────────────────────────────────
-    if ' ' in line and _IS_URL.search(line):
+    # ── 4. Space-separated: strip ALL URLs from anywhere in the line ─────
+    #   Remove URLs from any position (start, middle, end)
+    #   BUT: only if there are multiple space-separated tokens
+    #   (don't nuke single-token URL:cred lines like "https://site.com:user:pass")
+    if ' ' in line and _ANY_URL.search(line):
+        # Remove all URLs first
         tokens = line.split()
         cred_tokens = [t for t in tokens if not _IS_URL.match(t)]
         line = ' '.join(cred_tokens).strip() if cred_tokens else ""
         if not line:
             return ""
+        # After removing space-separated URLs, continue processing
+        # Don't return early - there may still be scheme-prefixed URLs to handle
 
     # ── 5. Protocol-relative //host ───────────────────────────────────────
     if line.startswith('//'):
@@ -545,7 +546,7 @@ def _strip_url(line: str) -> str:
         if not line:
             return ""
 
-    # ── 6. Scheme-prefixed URL: strip scheme://[host][:port][/path] ───────
+    # ── 6. Scheme-prefixed URL at start: strip scheme://[host][:port][/path] ───────
     #   IMPORTANT: do NOT consume user-info (user@) here — it might be the
     #   credential itself (e.g. https://site.com:user@gmail.com:pass).
     #   Only strip the scheme + bare hostname + optional port + optional path.
