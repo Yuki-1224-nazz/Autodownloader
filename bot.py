@@ -36,6 +36,7 @@ Features:
 
 import os, re, json, asyncio, aiohttp, aiofiles, logging, traceback, secrets, string
 import random
+import signal
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -384,6 +385,8 @@ _queue_list:  list          = []
 _queue_lock:  asyncio.Lock  = None
 _current_job: Job | None    = None
 _running_tasks: dict[int, asyncio.Task] = {}
+_watchdog_task: asyncio.Task = None
+_shutdown_event: asyncio.Event = None
 
 user_state: dict[int, dict] = defaultdict(lambda: {
     "step": "idle", "links": [], "keywords": [],
@@ -1572,6 +1575,9 @@ async def run_job(job: Job):
 # ─────────────────────────────────────────────────────────────────────
 async def _watchdog_queue_worker():
     while True:
+        if _shutdown_event and _shutdown_event.is_set():
+            log.info("queue_watchdog: shutdown requested — exiting cleanly.")
+            return
         task = asyncio.create_task(queue_worker(), name="queue_worker")
         try:
             await task
@@ -1589,12 +1595,18 @@ async def _watchdog_queue_worker():
 
 async def queue_worker():
     while True:
+        if _shutdown_event and _shutdown_event.is_set():
+            log.info("queue_worker: shutdown requested — exiting cleanly.")
+            return
         try:
             job = await _job_queue.get()
         except asyncio.CancelledError:
             log.warning("queue_worker: received shutdown CancelledError — exiting.")
             return
         except Exception as e:
+            if "Event loop is closed" in str(e):
+                log.info("queue_worker: event loop closed — exiting cleanly.")
+                return
             log.error(f"queue_worker: error waiting for job: {e}")
             await asyncio.sleep(1)
             continue
@@ -2595,12 +2607,36 @@ def main():
             except Exception as e:
                 log.warning(f"Could not set admin commands for {admin_id}: {e}")
 
-        asyncio.create_task(_watchdog_queue_worker(), name="queue_watchdog")
+        global _shutdown_event, _watchdog_task
+        _shutdown_event = asyncio.Event()
+        _watchdog_task = asyncio.create_task(_watchdog_queue_worker(), name="queue_watchdog")
         log.info("Queue worker started.")
 
+    async def post_stop(self, app: Application):
+        """Called after stopping the application - give tasks time to exit cleanly."""
+        log.info("Post-stop: signaling shutdown...")
+        if _shutdown_event:
+            _shutdown_event.set()
+        # Give tasks a moment to notice the shutdown flag and exit cleanly
+        await asyncio.sleep(0.5)
+
+    async def post_shutdown(self, app: Application):
+        """Graceful shutdown handler - cancel background tasks cleanly."""
+        log.info("Shutting down gracefully...")
+        if _watchdog_task and not _watchdog_task.done():
+            _watchdog_task.cancel()
+            try:
+                await asyncio.wait_for(_watchdog_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        log.info("Shutdown complete.")
+
     app.post_init = post_init
+    app.post_stop = post_stop
+    app.post_shutdown = post_shutdown
     log.info("Bot is running…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # Use close_loop=False to prevent the event loop from closing before our tasks can finish
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
 
 
 if __name__ == "__main__":
@@ -5215,11 +5251,12 @@ def main():
             except Exception as e:
                 log.warning(f"Could not set admin commands for {admin_id}: {e}")
 
+        global _shutdown_event, _watchdog_task
         _shutdown_event = asyncio.Event()
         _watchdog_task = asyncio.create_task(_watchdog_queue_worker(), name="queue_watchdog")
         log.info("Queue worker started.")
 
-    async def post_stop(self, app: Application):
+    async def post_stop(application: Application):
         """Called after stopping the application - give tasks time to exit cleanly."""
         log.info("Post-stop: signaling shutdown...")
         if _shutdown_event:
@@ -5227,7 +5264,7 @@ def main():
         # Give tasks a moment to notice the shutdown flag and exit cleanly
         await asyncio.sleep(0.5)
 
-    async def post_shutdown(self, app: Application):
+    async def post_shutdown(application: Application):
         """Graceful shutdown handler - cancel background tasks cleanly."""
         log.info("Shutting down gracefully...")
         if _watchdog_task and not _watchdog_task.done():
